@@ -5,7 +5,6 @@ process towards more realistic images.
 
 import argparse
 import os
-from cv2 import log
 
 import numpy as np
 import torch as th
