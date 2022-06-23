@@ -5,6 +5,7 @@ process towards more realistic images.
 
 import argparse
 import os
+from cv2 import log
 
 import numpy as np
 import torch as th
@@ -51,11 +52,12 @@ def main():
         classifier.convert_to_fp16()
     classifier.eval()
 
-    def cond_fn(x, t, y=None):
+    def cond_fn(x, t, y=None, fooly=None,):
         assert y is not None
         with th.enable_grad():
             x_in = x.detach().requires_grad_(True)
             logits = classifier(x_in, t)
+            logits, hidden = classifier(x_in, t, )
             log_probs = F.log_softmax(logits, dim=-1)
             selected = log_probs[range(len(logits)), y.view(-1)]
             return th.autograd.grad(selected.sum(), x_in)[0] * args.classifier_scale
@@ -67,12 +69,17 @@ def main():
     logger.log("sampling...")
     all_images = []
     all_labels = []
+    all_foolys = []
     while len(all_images) * args.batch_size < args.num_samples:
         model_kwargs = {}
         classes = th.randint(
             low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
         )
+        fool_classes = th.randint(
+            low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
+        )
         model_kwargs["y"] = classes
+        model_kwargs["adv_y"] = fool_classes
         sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
@@ -94,17 +101,20 @@ def main():
         gathered_labels = [th.zeros_like(classes) for _ in range(dist.get_world_size())]
         dist.all_gather(gathered_labels, classes)
         all_labels.extend([labels.cpu().numpy() for labels in gathered_labels])
+        all_foolys.extend(fool_classes.cpu().numpy())
         logger.log(f"created {len(all_images) * args.batch_size} samples")
 
     arr = np.concatenate(all_images, axis=0)
     arr = arr[: args.num_samples]
     label_arr = np.concatenate(all_labels, axis=0)
     label_arr = label_arr[: args.num_samples]
+    fool_label_arr = np.concatenate(all_foolys, axis=0)
+    fool_label_arr = fool_label_arr[: args.num_samples]
     if dist.get_rank() == 0:
         shape_str = "x".join([str(x) for x in arr.shape])
         out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
         logger.log(f"saving to {out_path}")
-        np.savez(out_path, arr, label_arr)
+        np.savez(out_path, arr, label_arr, fool_label_arr)
 
     dist.barrier()
     logger.log("sampling complete")
@@ -113,8 +123,8 @@ def main():
 def create_argparser():
     defaults = dict(
         clip_denoised=True,
-        num_samples=4,
-        batch_size=4,
+        num_samples=10000,
+        batch_size=16,
         use_ddim=False,
         model_path="",
         classifier_path="",
