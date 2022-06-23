@@ -708,6 +708,7 @@ class EncoderUNetModel(nn.Module):
         resblock_updown=False,
         use_new_attention_order=False,
         pool="adaptive",
+
     ):
         super().__init__()
 
@@ -853,6 +854,7 @@ class EncoderUNetModel(nn.Module):
             )
         else:
             raise NotImplementedError(f"Unexpected {pool} pooling")
+        
 
     def convert_to_fp16(self):
         """
@@ -868,7 +870,7 @@ class EncoderUNetModel(nn.Module):
         self.input_blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps):
+    def forward(self, x, timesteps, get_hidden=False, get_middle=False):
         """
         Apply the model to an input batch.
 
@@ -879,16 +881,24 @@ class EncoderUNetModel(nn.Module):
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
 
         results = []
+        hidden = []
         h = x.type(self.dtype)
         for module in self.input_blocks:
             h = module(h, emb)
             if self.pool.startswith("spatial"):
                 results.append(h.type(x.dtype).mean(dim=(2, 3)))
+            if get_hidden:
+                hidden.append(h)
         h = self.middle_block(h, emb)
+        if get_middle: hidden.append(h)
         if self.pool.startswith("spatial"):
             results.append(h.type(x.dtype).mean(dim=(2, 3)))
             h = th.cat(results, axis=-1)
+            if get_hidden or get_middle:
+                return self.out(h), hidden
             return self.out(h)
         else:
+            if get_hidden or get_middle:
+                return self.out(h), hidden
             h = h.type(x.dtype)
             return self.out(h)

@@ -6,8 +6,12 @@ process towards more realistic images.
 import argparse
 import os
 
+import shutil
+import json
 import numpy as np
 import torch as th
+import os.path as osp
+import datetime
 import torch.distributed as dist
 import torch.nn.functional as F
 
@@ -22,12 +26,23 @@ from guided_diffusion.script_util import (
     args_to_dict,
 )
 
+'''
+SAMPLE_FLAGS="--batch_size 5 --num_samples 5 --timestep_respacing 250"
+MODEL_FLAGS="--attention_resolutions 32,16,8 --class_cond True --diffusion_steps 500 --dropout 0.1 --image_size 64 --learn_sigma True\
+--noise_schedule cosine --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --resblock_updown True --use_new_attention_order True \
+--use_fp16 True --use_scale_shift_norm True"
+python guided-diffusion/scripts/adversarial_sample.py $MODEL_FLAGS --classifier_scale 1.0 --classifier_path 64x64_classifier.pt --classifier_depth 4 \
+--model_path 64x64_diffusion.pt $SAMPLE_FLAGS  --classifier_scale 1.0 --adv_scale 0.0 --describe ""
+'''
 
 def main():
     args = create_argparser().parse_args()
-
     dist_util.setup_dist()
-    logger.configure()
+    dir = osp.join('/root/hhtpro/123/result',
+            args.describe,
+            datetime.datetime.now().strftime("adv-%Y-%m-%d-%H-%M-%S-%f"),
+        )
+    logger.configure(dir)
 
     logger.log("creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(
@@ -50,18 +65,19 @@ def main():
     if args.classifier_use_fp16:
         classifier.convert_to_fp16()
     classifier.eval()
-
-    def cond_fn(x, t, y=None, fooly=None,):
+    # modify conf_fn and model_fn to get adv, conf_fn
+    def cond_fn(x, t, y=None, adv_y=None,):
         assert y is not None
         with th.enable_grad():
             x_in = x.detach().requires_grad_(True)
             logits = classifier(x_in, t)
-            logits, hidden = classifier(x_in, t, )
+            logits, hidden = classifier(x_in, t, args.get_hidden, args.get_middle)
+            
             log_probs = F.log_softmax(logits, dim=-1)
             selected = log_probs[range(len(logits)), y.view(-1)]
-            return th.autograd.grad(selected.sum(), x_in)[0] * args.classifier_scale
+            return -th.autograd.grad(selected.sum(), x_in)[0] * args.classifier_scale
 
-    def model_fn(x, t, y=None):
+    def model_fn(x, t, y=None, adv_y=None,):
         assert y is not None
         return model(x, t, y if args.class_cond else None)
 
@@ -107,13 +123,18 @@ def main():
     arr = arr[: args.num_samples]
     label_arr = np.concatenate(all_labels, axis=0)
     label_arr = label_arr[: args.num_samples]
-    fool_label_arr = np.concatenate(all_foolys, axis=0)
-    fool_label_arr = fool_label_arr[: args.num_samples]
+    fool_label_arr = all_foolys[:args.num_samples]
+    
     if dist.get_rank() == 0:
         shape_str = "x".join([str(x) for x in arr.shape])
         out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
         logger.log(f"saving to {out_path}")
         np.savez(out_path, arr, label_arr, fool_label_arr)
+        args_path = os.path.join(logger.get_dir(), f"exp.json")
+        info_json = json.dumps(vars(args), sort_keys=False, indent=4, separators=(' ', ':'))
+        with open(args_path, 'w') as f:
+            f.write(info_json)
+        shutil.copy('/root/hhtpro/123/guided-diffusion/scripts/adversarial_sample.py', logger.get_dir())
 
     dist.barrier()
     logger.log("sampling complete")
@@ -122,12 +143,16 @@ def main():
 def create_argparser():
     defaults = dict(
         clip_denoised=True,
-        num_samples=10000,
-        batch_size=16,
+        num_samples=5,
+        batch_size=5,
         use_ddim=False,
         model_path="",
         classifier_path="",
         classifier_scale=1.0,
+        adv_scale=0.0,
+        get_hidden=True,
+        get_middle=True, 
+        describe="default_desc"
     )
     defaults.update(model_and_diffusion_defaults())
     defaults.update(classifier_defaults())
