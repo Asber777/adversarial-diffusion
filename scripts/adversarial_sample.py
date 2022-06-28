@@ -14,6 +14,7 @@ import os.path as osp
 import datetime
 import torch.distributed as dist
 import torch.nn.functional as F
+from torchvision import transforms
 
 from guided_diffusion import dist_util, logger
 from guided_diffusion.script_util import (
@@ -28,7 +29,7 @@ from guided_diffusion.script_util import (
 
 '''
 SAMPLE_FLAGS="--batch_size 5 --num_samples 5 --timestep_respacing 250"
-MODEL_FLAGS="--attention_resolutions 32,16,8 --class_cond True --diffusion_steps 500 --dropout 0.1 --image_size 64 --learn_sigma True\
+MODEL_FLAGS="--attention_resolutions 32,16,8 --class_cond True --diffusion_steps 1000 --dropout 0.1 --image_size 64 --learn_sigma True \
 --noise_schedule cosine --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --resblock_updown True --use_new_attention_order True \
 --use_fp16 True --use_scale_shift_norm True"
 python guided-diffusion/scripts/adversarial_sample.py $MODEL_FLAGS --classifier_scale 1.0 --classifier_path 64x64_classifier.pt --classifier_depth 4 \
@@ -75,7 +76,7 @@ def main():
             
             log_probs = F.log_softmax(logits, dim=-1)
             selected = log_probs[range(len(logits)), y.view(-1)]
-            return -th.autograd.grad(selected.sum(), x_in)[0] * args.classifier_scale
+            return th.autograd.grad(selected.sum(), x_in)[0] * args.classifier_scale
 
     def model_fn(x, t, y=None, adv_y=None,):
         assert y is not None
@@ -130,12 +131,21 @@ def main():
         out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
         logger.log(f"saving to {out_path}")
         np.savez(out_path, arr, label_arr, fool_label_arr)
+        # save argparser json 
         args_path = os.path.join(logger.get_dir(), f"exp.json")
         info_json = json.dumps(vars(args), sort_keys=False, indent=4, separators=(' ', ':'))
         with open(args_path, 'w') as f:
             f.write(info_json)
+        # copy code in case some result need to check it's historical implementation.
         shutil.copy('/root/hhtpro/123/guided-diffusion/scripts/adversarial_sample.py', logger.get_dir())
-
+        show_pic_n = 5
+        picture = arr[:show_pic_n]
+        picture = th.from_numpy(picture)
+        picture = picture.permute(0, 3, 1, 2)
+        row_picture = th.cat([pic for pic in picture], 2)
+        unloader = transforms.ToPILImage()
+        unloader(row_picture).save(osp.join(logger.get_dir(), "result.jpg"))
+    
     dist.barrier()
     logger.log("sampling complete")
 
