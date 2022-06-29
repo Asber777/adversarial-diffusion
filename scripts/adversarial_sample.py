@@ -29,28 +29,20 @@ from guided_diffusion.script_util import (
 )
 
 '''
+This file can generate new adversarial images that look like y but are classified as 
+guide_y which is asign by us. 
+Use following command to do so:
 SAMPLE_FLAGS="--batch_size 5 --num_samples 5 --timestep_respacing 250"
 MODEL_FLAGS="--attention_resolutions 32,16,8 --class_cond True --diffusion_steps 1000 --dropout 0.1 --image_size 64 --learn_sigma True \
 --noise_schedule cosine --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --resblock_updown True --use_new_attention_order True \
 --use_fp16 True --use_scale_shift_norm True"
-python guided-diffusion/scripts/adversarial_sample.py $MODEL_FLAGS --classifier_scale 1.0 --classifier_path 64x64_classifier.pt --classifier_depth 4 \
---model_path 64x64_diffusion.pt $SAMPLE_FLAGS  --classifier_scale 1.0 --adv_scale 0.0 --describe ""
+python guided-diffusion/scripts/adversarial_sample.py $MODEL_FLAGS --classifier_path 64x64_classifier.pt --classifier_depth 4 \
+--model_path 64x64_diffusion.pt $SAMPLE_FLAGS  --classifier_scale 1.0 --adv_scale 0.0 --describe "adv_generate"
 '''
 
 def main():
     args = create_argparser().parse_args()
     dist_util.setup_dist()
-
-    # get guide picture and check batchsize
-    guide_path = osp.join(args.result_dir, args.guide_exp, "samples_5x64x64x3.npz")
-    guide_np = np.load(guide_path)
-    guide_x_np = guide_np['arr_0']
-    guide_y_np = guide_np['arr_1']
-    assert args.batch_size <= len(guide_y_np)
-    guide_x = th.from_numpy(guide_x_np[:args.batch_size]).to(dist_util.dev())
-    guide_x = guide_x.permute(0, 3, 1, 2)
-    guide_x = ((guide_x/127.5) -1.).clamp(-1., 1.) # to float32?
-    guide_y = th.from_numpy(guide_y_np[:args.batch_size]).to(dist_util.dev())
 
     dir = osp.join(args.result_dir, args.describe,
         datetime.datetime.now().strftime("adv-%Y-%m-%d-%H-%M-%S-%f"),
@@ -79,13 +71,31 @@ def main():
         classifier.convert_to_fp16()
     classifier.eval()
     # modify conf_fn and model_fn to get adv, conf_fn
+
+        # get guide picture and check batchsize
+    if args.guide_exp:
+        guide_path = osp.join(args.result_dir, args.guide_exp, "samples_5x64x64x3.npz")
+        guide_np = np.load(guide_path)
+        guide_x_np = guide_np['arr_0']
+        guide_y_np = guide_np['arr_1']
+        assert args.batch_size <= len(guide_y_np)
+        guide_x = th.from_numpy(guide_x_np[:args.batch_size]).to(dist_util.dev())
+        guide_x = guide_x.permute(0, 3, 1, 2)
+        guide_x = ((guide_x/127.5) -1.).clamp(-1., 1.) # to float32?
+        guide_y = th.from_numpy(guide_y_np[:args.batch_size]).to(dist_util.dev())
+    else:
+        guide_x_np = None
+        guide_y_np = np.array([1, 2, 3, 4, 5])
+        guide_y = th.from_numpy(guide_y_np[:args.batch_size]).to(dist_util.dev())
+
     def cond_fn(x, t, y=None,):
         assert y is not None
         with th.enable_grad():
             # hidden_loss = 0
             x_in = x.detach().requires_grad_(True)
             # guide_logits, guide_hidden = classifier(guide_x, t, args.get_hidden, args.get_middle)
-            logits, hidden = classifier(x_in, t, args.get_hidden, args.get_middle)
+            # logits, hidden = classifier(x_in, t, args.get_hidden, args.get_middle)
+            logits = classifier(x_in, t)
             # for h, gh in zip(hidden, guide_hidden):
             #     hidden_loss += (h * gh).mean()
             log_probs = F.log_softmax(logits, dim=-1)
@@ -122,7 +132,7 @@ def main():
             cond_fn=cond_fn,
             device=dist_util.dev(),
         )
-        log_probs = F.log_softmax(classifier(sample, th.zeros_like(guide_y)), dim=-1)
+        log_probs = classifier(sample, th.zeros_like(guide_y))
         predict = log_probs.argmax(dim=-1)
 
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
@@ -151,16 +161,15 @@ def main():
         shape_str = "x".join([str(x) for x in arr.shape])
         out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
         logger.log(f"saving to {out_path}")
-        with open("/root/hhtpro/123/guided-diffusion/scripts/image_label_map.txt") as fp:
-            sample = fp.readlines()
-            result_dict = {}
-            for line in sample:
-                sample_ = line.split('\t',maxsplit=1)
-                result_dict[int(sample_[0])]=sample_[1].split('\n')[0]
+        map_i_s = get_index_name_map()
         for i, (y_, p_) in enumerate(zip(label_arr, predict_arr)):
-            logger.log(f"label_{i}:{y_}, guide_y_{i%args.batch_size}:{guide_y_np[i%args.batch_size]}, predict{i}:{p_}")
-            logger.log(f"{result_dict[y_]} ; {result_dict[guide_y_np[i%args.batch_size]]}; {result_dict[p_]}")
-        np.savez(out_path, arr, label_arr, guide_x_np, guide_y_np, predict_arr)
+            g_y = guide_y_np[i%args.batch_size]
+            logger.log(f"label_{i}:{y_}, guide_y_{i%args.batch_size}:{g_y}, predict{i}:{p_}")
+            logger.log(f"{map_i_s[y_]} ; {map_i_s[g_y]}; {map_i_s[p_]}")
+        if guide_x_np:
+            np.savez(out_path, arr, guide_x_np, label_arr, guide_y_np, predict_arr)
+        else:
+            np.savez(out_path, arr, label_arr, guide_y_np, predict_arr)
         # save argparser json 
         args_path = os.path.join(logger.get_dir(), f"exp.json")
         info_json = json.dumps(vars(args), sort_keys=False, indent=4, separators=(' ', ':'))
@@ -186,7 +195,7 @@ def main():
 def create_argparser():
     defaults = dict(
         result_dir='/root/hhtpro/123/result',
-        guide_exp="orginal_generate/adv-2022-06-28-17-58-50-678509",
+        guide_exp="",
         clip_denoised=True,
         num_samples=5,
         batch_size=5,
@@ -206,6 +215,14 @@ def create_argparser():
     add_dict_to_argparser(parser, defaults)
     return parser
 
+def get_index_name_map():
+    result_dict = {}
+    with open("/root/hhtpro/123/guided-diffusion/scripts/image_label_map.txt") as fp:
+        sample = fp.readlines()
+        for line in sample:
+            sample_ = line.split('\t',maxsplit=1)
+            result_dict[int(sample_[0])]=sample_[1].split('\n')[0]
+    return result_dict
 
 if __name__ == "__main__":
     main()
