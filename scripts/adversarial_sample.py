@@ -8,6 +8,7 @@ import os
 
 import shutil
 import json
+from matplotlib.pyplot import axis
 import numpy as np
 import torch as th
 import os.path as osp
@@ -39,10 +40,21 @@ python guided-diffusion/scripts/adversarial_sample.py $MODEL_FLAGS --classifier_
 def main():
     args = create_argparser().parse_args()
     dist_util.setup_dist()
-    dir = osp.join('/root/hhtpro/123/result',
-            args.describe,
-            datetime.datetime.now().strftime("adv-%Y-%m-%d-%H-%M-%S-%f"),
-        )
+
+    # get guide picture and check batchsize
+    guide_path = osp.join(args.result_dir, args.guide_exp, "samples_5x64x64x3.npz")
+    guide_np = np.load(guide_path)
+    guide_x_np = guide_np['arr_0']
+    guide_y_np = guide_np['arr_1']
+    assert args.batch_size <= len(guide_y_np)
+    guide_x = th.from_numpy(guide_x_np[:args.batch_size]).to(dist_util.dev())
+    guide_x = guide_x.permute(0, 3, 1, 2)
+    guide_x = ((guide_x/127.5) -1.).clamp(-1., 1.) # to float32?
+    guide_y = th.from_numpy(guide_y_np[:args.batch_size]).to(dist_util.dev())
+
+    dir = osp.join(args.result_dir, args.describe,
+        datetime.datetime.now().strftime("adv-%Y-%m-%d-%H-%M-%S-%f"),
+    )
     logger.configure(dir)
 
     logger.log("creating model and diffusion...")
@@ -67,35 +79,38 @@ def main():
         classifier.convert_to_fp16()
     classifier.eval()
     # modify conf_fn and model_fn to get adv, conf_fn
-    def cond_fn(x, t, y=None, adv_y=None,):
+    def cond_fn(x, t, y=None,):
         assert y is not None
         with th.enable_grad():
+            # hidden_loss = 0
             x_in = x.detach().requires_grad_(True)
-            logits = classifier(x_in, t)
+            # guide_logits, guide_hidden = classifier(guide_x, t, args.get_hidden, args.get_middle)
             logits, hidden = classifier(x_in, t, args.get_hidden, args.get_middle)
-            
+            # for h, gh in zip(hidden, guide_hidden):
+            #     hidden_loss += (h * gh).mean()
             log_probs = F.log_softmax(logits, dim=-1)
-            selected = log_probs[range(len(logits)), y.view(-1)]
-            return th.autograd.grad(selected.sum(), x_in)[0] * args.classifier_scale
+            selected = log_probs[range(len(logits)), guide_y.view(-1)]
+            loss = selected.sum() * args.classifier_scale
+            # t = t[0].cpu().detach().item()
+            # logger.log("hidden_loss_{}: {}".format(t, hidden_loss.detach()))
+            # logger.log("guide_loss_{}: {}".format(t, selected.sum().detach()))
+            # loss = hidden_loss * args.hidden_scale
+            return th.autograd.grad(loss, x_in)[0]
 
-    def model_fn(x, t, y=None, adv_y=None,):
+    def model_fn(x, t, y=None,):
         assert y is not None
         return model(x, t, y if args.class_cond else None)
 
     logger.log("sampling...")
     all_images = []
     all_labels = []
-    all_foolys = []
+    all_predict = []
     while len(all_images) * args.batch_size < args.num_samples:
         model_kwargs = {}
         classes = th.randint(
             low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
         )
-        fool_classes = th.randint(
-            low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
-        )
         model_kwargs["y"] = classes
-        model_kwargs["adv_y"] = fool_classes
         sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
@@ -107,6 +122,9 @@ def main():
             cond_fn=cond_fn,
             device=dist_util.dev(),
         )
+        log_probs = F.log_softmax(classifier(sample, th.zeros_like(guide_y)), dim=-1)
+        predict = log_probs.argmax(dim=-1)
+
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)
         sample = sample.contiguous()
@@ -117,20 +135,32 @@ def main():
         gathered_labels = [th.zeros_like(classes) for _ in range(dist.get_world_size())]
         dist.all_gather(gathered_labels, classes)
         all_labels.extend([labels.cpu().numpy() for labels in gathered_labels])
-        all_foolys.extend(fool_classes.cpu().numpy())
+        gathered_predicts = [th.zeros_like(predict) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered_predicts, predict)
+        all_predict.extend([predict.cpu().numpy() for predict in gathered_predicts])
         logger.log(f"created {len(all_images) * args.batch_size} samples")
 
     arr = np.concatenate(all_images, axis=0)
     arr = arr[: args.num_samples]
     label_arr = np.concatenate(all_labels, axis=0)
     label_arr = label_arr[: args.num_samples]
-    fool_label_arr = all_foolys[:args.num_samples]
+    predict_arr = np.concatenate(all_predict, axis=0)
+    predict_arr = predict_arr[:args.num_samples]
     
     if dist.get_rank() == 0:
         shape_str = "x".join([str(x) for x in arr.shape])
         out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
         logger.log(f"saving to {out_path}")
-        np.savez(out_path, arr, label_arr, fool_label_arr)
+        with open("/root/hhtpro/123/guided-diffusion/scripts/image_label_map.txt") as fp:
+            sample = fp.readlines()
+            result_dict = {}
+            for line in sample:
+                sample_ = line.split('\t',maxsplit=1)
+                result_dict[int(sample_[0])]=sample_[1].split('\n')[0]
+        for i, (y_, p_) in enumerate(zip(label_arr, predict_arr)):
+            logger.log(f"label_{i}:{y_}, guide_y_{i%args.batch_size}:{guide_y_np[i%args.batch_size]}, predict{i}:{p_}")
+            logger.log(f"{result_dict[y_]} ; {result_dict[guide_y_np[i%args.batch_size]]}; {result_dict[p_]}")
+        np.savez(out_path, arr, label_arr, guide_x_np, guide_y_np, predict_arr)
         # save argparser json 
         args_path = os.path.join(logger.get_dir(), f"exp.json")
         info_json = json.dumps(vars(args), sort_keys=False, indent=4, separators=(' ', ':'))
@@ -150,8 +180,13 @@ def main():
     logger.log("sampling complete")
 
 
+    # 读取引导图, 引导图的数量>=batch_size
+    # 每次生产都是用过相同的引导图. 
+
 def create_argparser():
     defaults = dict(
+        result_dir='/root/hhtpro/123/result',
+        guide_exp="orginal_generate/adv-2022-06-28-17-58-50-678509",
         clip_denoised=True,
         num_samples=5,
         batch_size=5,
@@ -159,6 +194,7 @@ def create_argparser():
         model_path="",
         classifier_path="",
         classifier_scale=1.0,
+        hidden_scale=1.0,
         adv_scale=0.0,
         get_hidden=True,
         get_middle=True, 
