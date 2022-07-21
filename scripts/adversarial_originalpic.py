@@ -1,6 +1,4 @@
 import argparse
-from ast import arg
-from asyncore import write
 import os
 
 import shutil
@@ -16,7 +14,7 @@ from torch import clamp
 from torchvision import transforms
 import lpips
 from robustbench.utils import load_model
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid
 
 
@@ -44,7 +42,8 @@ MODEL_FLAGS="--attention_resolutions 32,16,8 --class_cond True --diffusion_steps
 --noise_schedule cosine --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --resblock_updown True --use_new_attention_order True \
 --use_fp16 True --use_scale_shift_norm True"
 python guided-diffusion/scripts/adversarial_originalpic.py $MODEL_FLAGS --classifier_path 64x64_classifier.pt --classifier_depth 4 \
---model_path 64x64_diffusion.pt $SAMPLE_FLAGS  --generate_scale 13.0 --guide_scale 13.0 --hidden_scale 20.0 --describe "pic_and_adv_guide"
+--model_path 64x64_diffusion.pt $SAMPLE_FLAGS  --generate_scale 10.0 --guide_scale 20.0 --splitT 400\
+     --lpips_scale 30.0 --hidden_scale 10.0 --describe "lpips_construct_and_adv_guide" --use_pgd True
 '''
 
 def get_idex2name_map():
@@ -70,7 +69,9 @@ def create_argparser():
         generate_scale=1.0,
         guide_scale=1.0, 
         hidden_scale=1.0,
+        lpips_scale=1.0, 
         use_lpips=True, 
+        use_mse=True, 
         use_pgd=False, 
         get_hidden=True,
         get_middle=True, 
@@ -118,11 +119,15 @@ def main():
         classifier.convert_to_fp16()
     classifier.eval()
 
+    attack_model = load_model(model_name='Standard_R50', dataset='imagenet', threat_model='Linf')
+    attack_model = attack_model.to(dist_util.dev())
+
     loss_fn_alex = lpips.LPIPS(net='alex')
     loss_fn_alex = loss_fn_alex.to(dist_util.dev())
 
     writer = SummaryWriter(logger.get_dir()+'/'+args.describe)
-    
+    # writer = SummaryWriter(logger.get_dir())
+
     # get guide picture and guide_y generate y
     if args.guide_exp is not None:
         logger.log("This experiment is guide_exp")
@@ -151,9 +156,7 @@ def main():
             low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
         )
     if args.use_pgd: 
-        predict = load_model(model_name='Standard_R50', dataset='imagenet', threat_model='Linf')
-        predict = predict.to(dist_util.dev())
-        def pgd(x, y, nb_iter=10, eps=8./255, eps_iter=2./255, 
+        def pgd(x, y, nb_iter=1, eps=8./255, eps_iter=1./255, 
                 clip_min=0.0, clip_max=1.0, random_init = True):
             x, y = x.detach().clone(), y.detach().clone()
             # init delta randomly
@@ -167,7 +170,7 @@ def main():
             with th.enable_grad():
                 delta.requires_grad_()
                 for _ in range(nb_iter):
-                    outputs = predict(x + delta)
+                    outputs = attack_model(x + delta)
                     loss = nn.CrossEntropyLoss(reduction="sum")(outputs, y)
                     loss.backward()
                     # first limit delta in [-eps,eps] then limit data in [clip_min,clip_max](inf_ord)
@@ -179,25 +182,25 @@ def main():
                     delta.grad.data.zero_()
                 x_adv = clamp(x + delta, clip_min, clip_max)
             return x_adv.data
-
     # modify conf_fn and model_fn to get adv
     def cond_fn(x, t, y=None, mean=None, variance=None, **kwargs):
         assert y is not None
         assert mean is not None
         assert variance is not None
-        time = t[0].detach().cpu().item()
-        print(time)
+        time = t[0].detach().clone().cpu().item()
         with th.enable_grad():
             hidden_loss = 0
+            lpips_loss = 0
             x_in = x.detach().requires_grad_(True)
             if args.use_lpips == True:
-                hidden_loss -= loss_fn_alex.forward(x_in, guide_x).sum()
-                logits = classifier(x_in, t)
-            else:
+                lpips_loss -= loss_fn_alex.forward(x_in, guide_x).sum()
+            if args.use_mse == True:
                 _, guide_hidden = classifier(guide_x, t, args.get_hidden, args.get_middle)
                 logits, hidden = classifier(x_in, t, args.get_hidden, args.get_middle)
                 for h, gh in zip(hidden, guide_hidden):
                     hidden_loss -= ((h - gh)**2).mean()
+            else:
+                logits = classifier(x_in, t)
             # when t>splitT, use generate_y else guide_y
             # I think it's dummy to do so, we should optimize pic fid 
             # as use genrate_y when it's classified as guide_y, 
@@ -208,13 +211,16 @@ def main():
             selected = log_probs[range(len(logits)), new_y.view(-1)]
             loss = selected.sum() * s
             loss += hidden_loss * args.hidden_scale
+            loss += lpips_loss * args.lpips_scale
             gradient = th.autograd.grad(loss, x_in)[0]
-            writer.add_scalar('hidden_loss', hidden_loss.cpu().item(), time)
-            writer.add_scalar('selected_loss', selected.sum().cpu().item(), time)
-            writer.add_scalar('loss', loss.cpu().item(), time)
+        writer.add_scalar('test', time, time)
+        writer.add_scalar('lpips_loss', lpips_loss.clone().detach().cpu().item(), time)
+        writer.add_scalar('hidden_loss', hidden_loss.detach().clone().cpu().item(), time)
+        writer.add_scalar('selected_loss', selected.detach().clone().sum().cpu().item(), time)
+        writer.add_scalar('loss', loss.detach().clone().cpu().item(), time)
         new_mean = (mean.float() + variance * gradient.float())
-        writer.add_image('mean', make_grid(new_mean, args.batch_size, normalize=True), time)
-        if args.use_pgd and t[0] < 100:
+        writer.add_image('mean', make_grid(new_mean.detach().clone(), args.batch_size, normalize=True), time)
+        if args.use_pgd and t[0] < 10:
             x = new_mean * 0.5 + 0.5
             advx = pgd(x, guide_y, )
             new_mean = (advx - 0.5) * 2.0
