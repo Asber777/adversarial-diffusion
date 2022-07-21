@@ -13,6 +13,7 @@ import torch.nn as nn
 from torch import clamp
 from torchvision import transforms
 import lpips
+from pytorch_msssim import ssim, ms_ssim
 from robustbench.utils import load_model
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid
@@ -31,6 +32,8 @@ from guided_diffusion.script_util import (
 )
 
 SHOW_PIC_N = 5
+# hidden_index = [10, 11, 12, 13, 14, 15,16, 17,18,19]
+hidden_index = [1, 2, 3, 4, 5, 6, 7]
 ORGINAL_PIC_PATH = "generate_original/classifier_scale10/adv-2022-06-29-00-04-25-887867"
 INDEX2NAME_MAP_PATH = "/root/hhtpro/123/guided-diffusion/scripts/image_label_map.txt"
 '''
@@ -42,8 +45,8 @@ MODEL_FLAGS="--attention_resolutions 32,16,8 --class_cond True --diffusion_steps
 --noise_schedule cosine --num_channels 192 --num_head_channels 64 --num_res_blocks 3 --resblock_updown True --use_new_attention_order True \
 --use_fp16 True --use_scale_shift_norm True"
 python guided-diffusion/scripts/adversarial_originalpic.py $MODEL_FLAGS --classifier_path 64x64_classifier.pt --classifier_depth 4 \
---model_path 64x64_diffusion.pt $SAMPLE_FLAGS  --generate_scale 10.0 --guide_scale 20.0 --splitT 400\
-     --lpips_scale 30.0 --hidden_scale 10.0 --describe "lpips_construct_and_adv_guide" --use_pgd True
+--model_path 64x64_diffusion.pt $SAMPLE_FLAGS  --generate_scale 5.0 --guide_scale 5.0 --splitT 400\
+     --lpips_scale 0.0 --hidden_scale 10.0 --describe "lpips_construct_and_adv_guide" --use_pgd True --guide_as_generate True
 '''
 
 def get_idex2name_map():
@@ -70,8 +73,10 @@ def create_argparser():
         guide_scale=1.0, 
         hidden_scale=1.0,
         lpips_scale=1.0, 
+        ssim_scale=1.0, 
         use_lpips=True, 
-        use_mse=True, 
+        use_mse=False,
+        use_ssim=True,  
         use_pgd=False, 
         get_hidden=True,
         get_middle=True, 
@@ -95,9 +100,10 @@ def main():
 
     logger.log("creating model and diffusion...")
     logger.log(
-        "current config is splitT: {}, guide_exp: {}, hidden_scale: {}, generate_scale: {}, guide_scale: {}".format(
-                 args.splitT, args.guide_exp, args.hidden_scale,
-                  args.generate_scale, args.guide_scale))
+        "current config is splitT: {}, guide_exp: {}, ssim_scale: {}, lpips_scale: {}, \
+            hidden_scale: {}, generate_scale: {}, guide_scale: {}".format(
+                 args.splitT, args.guide_exp, args.ssim_scale, args.lpips_scale,
+                  args.hidden_scale, args.generate_scale, args.guide_scale))
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
@@ -191,12 +197,17 @@ def main():
         with th.enable_grad():
             hidden_loss = 0
             lpips_loss = 0
+            ssim_loss = 0
             x_in = x.detach().requires_grad_(True)
             if args.use_lpips == True:
                 lpips_loss -= loss_fn_alex.forward(x_in, guide_x).sum()
+            if args.use_ssim == True: 
+                ssim_loss = ssim((guide_x+1)/2, (x_in+1)/2, data_range=1, size_average=True)
             if args.use_mse == True:
-                _, guide_hidden = classifier(guide_x, t, args.get_hidden, args.get_middle)
-                logits, hidden = classifier(x_in, t, args.get_hidden, args.get_middle)
+                _, guide_hidden = classifier(guide_x, t, \
+                    args.get_hidden, args.get_middle, hidden_index)
+                logits, hidden = classifier(x_in, t, \
+                    args.get_hidden, args.get_middle, hidden_index)
                 for h, gh in zip(hidden, guide_hidden):
                     hidden_loss -= ((h - gh)**2).mean()
             else:
@@ -210,12 +221,13 @@ def main():
             s = args.generate_scale if time > args.splitT else args.guide_scale
             selected = log_probs[range(len(logits)), new_y.view(-1)]
             loss = selected.sum() * s
+            loss += ssim_loss * args.ssim_scale
             loss += hidden_loss * args.hidden_scale
             loss += lpips_loss * args.lpips_scale
             gradient = th.autograd.grad(loss, x_in)[0]
         writer.add_scalar('test', time, time)
-        writer.add_scalar('lpips_loss', lpips_loss.clone().detach().cpu().item(), time)
-        writer.add_scalar('hidden_loss', hidden_loss.detach().clone().cpu().item(), time)
+        if args.use_lpips: writer.add_scalar('lpips_loss', lpips_loss.clone().detach().cpu().item(), time)
+        if args.use_mse: writer.add_scalar('hidden_loss', hidden_loss.detach().clone().cpu().item(), time)
         writer.add_scalar('selected_loss', selected.detach().clone().sum().cpu().item(), time)
         writer.add_scalar('loss', loss.detach().clone().cpu().item(), time)
         new_mean = (mean.float() + variance * gradient.float())

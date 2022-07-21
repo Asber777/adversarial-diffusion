@@ -870,7 +870,7 @@ class EncoderUNetModel(nn.Module):
         self.input_blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, get_hidden=False, get_middle=False):
+    def forward(self, x, timesteps, get_hidden=False, get_middle=False, hidden_index=[]):
         """
         Apply the model to an input batch.
 
@@ -883,11 +883,11 @@ class EncoderUNetModel(nn.Module):
         results = []
         hidden = []
         h = x.type(self.dtype)
-        for module in self.input_blocks:
+        for i, module in enumerate(self.input_blocks):
             h = module(h, emb)
             if self.pool.startswith("spatial"):
                 results.append(h.type(x.dtype).mean(dim=(2, 3)))
-            if get_hidden:
+            if get_hidden and i in hidden_index: # 20层
                 hidden.append(h)
         h = self.middle_block(h, emb)
         if get_middle: hidden.append(h)
