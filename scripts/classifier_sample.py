@@ -51,14 +51,17 @@ def main():
         classifier.convert_to_fp16()
     classifier.eval()
 
-    def cond_fn(x, t, y=None):
+    def cond_fn(x, t, y=None, mean=None, variance=None,**kwargs):
         assert y is not None
+        assert mean is not None
+        assert variance is not None
         with th.enable_grad():
             x_in = x.detach().requires_grad_(True)
             logits = classifier(x_in, t)
             log_probs = F.log_softmax(logits, dim=-1)
             selected = log_probs[range(len(logits)), y.view(-1)]
-            return th.autograd.grad(selected.sum(), x_in)[0] * args.classifier_scale
+            gradient = th.autograd.grad(selected.sum(), x_in)[0] * args.classifier_scale
+        return (mean.float() + variance * gradient.float())
 
     def model_fn(x, t, y=None):
         assert y is not None
@@ -129,3 +132,4 @@ def create_argparser():
 
 if __name__ == "__main__":
     main()
+

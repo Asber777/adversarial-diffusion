@@ -46,7 +46,7 @@ MODEL_FLAGS="--attention_resolutions 32,16,8 --class_cond True --diffusion_steps
 --use_fp16 True --use_scale_shift_norm True"
 python guided-diffusion/scripts/adversarial_originalpic.py $MODEL_FLAGS --classifier_path 64x64_classifier.pt --classifier_depth 4 \
 --model_path 64x64_diffusion.pt $SAMPLE_FLAGS  --generate_scale 5.0 --guide_scale 5.0 --splitT 400\
-     --lpips_scale 0.0 --hidden_scale 10.0 --describe "lpips_construct_and_adv_guide" --use_pgd True --guide_as_generate True
+--lpips_scale 0.0 --hidden_scale 10.0 --describe "lpips_construct_and_adv_guide" --use_pgd True --guide_as_generate True
 '''
 
 def get_idex2name_map():
@@ -189,6 +189,7 @@ def main():
                 x_adv = clamp(x + delta, clip_min, clip_max)
             return x_adv.data
     # modify conf_fn and model_fn to get adv
+
     def cond_fn(x, t, y=None, mean=None, variance=None, **kwargs):
         assert y is not None
         assert mean is not None
@@ -206,7 +207,7 @@ def main():
             if args.use_mse == True:
                 _, guide_hidden = classifier(guide_x, t, \
                     args.get_hidden, args.get_middle, hidden_index)
-                logits, hidden = classifier(x_in, t, \
+                _, hidden = classifier(x_in, t, \
                     args.get_hidden, args.get_middle, hidden_index)
                 for h, gh in zip(hidden, guide_hidden):
                     hidden_loss -= ((h - gh)**2).mean()
@@ -216,6 +217,7 @@ def main():
             # I think it's dummy to do so, we should optimize pic fid 
             # as use genrate_y when it's classified as guide_y, 
             # and use guide_y when it's classified as other label. 
+            # logits = classifier(x_in, t) if time>args.splitT else attack_model(((x_in+1)/2.)[:, :, 16:240, 16:240])
             log_probs = F.log_softmax(logits, dim=-1)
             new_y = th.where(t>args.splitT, generate_y, guide_y)
             s = args.generate_scale if time > args.splitT else args.guide_scale
@@ -259,8 +261,11 @@ def main():
             cond_fn=cond_fn,
             device=dist_util.dev(),
         )
+        
         log_probs = classifier(sample, th.zeros_like(generate_y))
+        # log_probs = attack_model(((sample+1)/2.)[:, :, 16:240, 16:240])
         predict = log_probs.argmax(dim=-1)
+        
         # scale from [-1, 1] to [0, 255]
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)

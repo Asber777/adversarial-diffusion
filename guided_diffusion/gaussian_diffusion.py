@@ -361,10 +361,18 @@ class GaussianDiffusion:
         condition on y.
 
         This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
+        # Modify by CXQ: cond_fn not only compute grad of x, but also compute
+        # mean of next X, so you need to wrap mean and variance to model_kwargs,
+        # and send to cond_fn. 
         """
-        model_kwargs['mean'] = p_mean_var['mean']
-        model_kwargs['variance'] = p_mean_var['variance']
-        return cond_fn(x, self._scale_timesteps(t), **model_kwargs)
+        gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
+        new_mean = (
+            p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
+        )
+        return new_mean
+        # model_kwargs['mean'] = p_mean_var['mean']
+        # model_kwargs['variance'] = p_mean_var['variance']
+        # return cond_fn(x, self._scale_timesteps(t), **model_kwargs)
 
     def condition_score(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
         """

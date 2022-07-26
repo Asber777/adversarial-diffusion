@@ -1,12 +1,36 @@
 import argparse
 import inspect
-
+import os, json
+import torch as th 
+from torchvision import transforms
+import os.path as osp
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
 from .unet import SuperResModel, UNetModel, EncoderUNetModel
 
 NUM_CLASSES = 1000
 
+def get_idex2name_map(INDEX2NAME_MAP_PATH):
+    result_dict = {}
+    with open(INDEX2NAME_MAP_PATH) as fp:
+        sample = fp.readlines()
+        for line in sample:
+            sample_ = line.split('\t',maxsplit=1)
+            result_dict[int(sample_[0])]=sample_[1].split('\n')[0]
+    return result_dict
+
+def arr2pic_save(arr, logdir, SHOW_PIC_N=5):
+    picture = th.from_numpy(arr[:SHOW_PIC_N])
+    picture = picture.permute(0, 3, 1, 2)
+    picture = th.cat([pic for pic in picture], 2)
+    unloader = transforms.ToPILImage()
+    unloader(picture).save(osp.join(logdir, "result.jpg"))
+
+def save_args(logger_dir, args):
+    args_path = os.path.join(logger_dir, f"exp.json")
+    info_json = json.dumps(vars(args), sort_keys=False, indent=4, separators=(' ', ':'))
+    with open(args_path, 'w') as f:
+        f.write(info_json)
 
 def diffusion_defaults():
     """
