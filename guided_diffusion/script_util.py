@@ -19,9 +19,11 @@ def get_idex2name_map(INDEX2NAME_MAP_PATH):
             result_dict[int(sample_[0])]=sample_[1].split('\n')[0]
     return result_dict
 
-def arr2pic_save(arr, logdir, SHOW_PIC_N=5, name="result.jpg"):
+def arr2pic_save(arr, logdir, SHOW_PIC_N=5, name="result.jpg", trans=True):
+    # arr range from -1 to 1
     picture = th.from_numpy(arr[:SHOW_PIC_N])
-    picture = picture.permute(0, 3, 1, 2)
+    if trans: picture = (picture + 1) / 2.0
+    assert picture.shape[1] == 3
     picture = th.cat([pic for pic in picture], 2)
     unloader = transforms.ToPILImage()
     unloader(picture).save(osp.join(logdir, name))

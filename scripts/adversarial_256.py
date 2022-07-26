@@ -7,18 +7,16 @@ import os.path as osp
 import datetime
 import torch.distributed as dist
 import torch.nn.functional as F
-import torch.nn as nn
-from torch import clamp
-from torchvision import transforms
 import lpips
 from pytorch_msssim import ssim, ms_ssim
 from robustbench.utils import load_model
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid
+from torch.nn.functional import one_hot
 
 from guided_diffusion import dist_util, logger
 from guided_diffusion.script_util import (
-    NUM_CLASSES,
+    NUM_CLASSES, 
     model_and_diffusion_defaults,
     classifier_defaults,
     create_model_and_diffusion,
@@ -30,9 +28,9 @@ from guided_diffusion.script_util import (
     save_args, 
     arr2pic_save, 
 )
-
-hidden_index = [1,2,3,4,5,6,7]
-GUIDE_Y = [583, 445, 703, 546, 254]
+TARGET_MULT = 10000.0
+hidden_index = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+# GUIDE_Y = [583, 445, 703, 546, 254]
 INDEX2NAME_MAP_PATH = "/root/hhtpro/123/guided-diffusion/scripts/image_label_map.txt"
 DT = lambda :datetime.datetime.now().strftime("adv-%Y-%m-%d-%H-%M-%S-%f")
 
@@ -46,15 +44,15 @@ def create_argparser():
         batch_size=5,
         model_path="/root/hhtpro/123/256x256_diffusion.pt",
         classifier_path="/root/hhtpro/123/256x256_classifier.pt",
-        splitT=200, 
-        generate_scale=10.0,
-        guide_scale=0.0, 
+        splitT=500, 
+        generate_scale=1.0,
+        guide_scale=10.0, 
         hidden_scale=1.0,
-        lpips_scale=10.0, 
-        ssim_scale=10.0, 
-        use_lpips=True, 
+        lpips_scale=0.0, 
+        ssim_scale=0.0, 
+        use_lpips=False, 
         use_mse=False,
-        use_ssim=True, 
+        use_ssim=False, 
         get_hidden=False,
         get_middle=False, 
         guide_as_generate=False, 
@@ -124,31 +122,12 @@ def main():
 
     data_generator = load_imagenet_batch(args.batch_size, '/root/hhtpro/123/imagenet')
     
-    # if args.guide_exp:
-    #     logger.log("This experimen t is guide_exp")
-    #     guide_path = osp.join(args.result_dir, args.guide_exp, "samples_5x256x256x3.npz")
-    #     guide_np = np.load(guide_path)
-    #     guide_x_np, generate_y_np = guide_np['arr_0'], guide_np['arr_1']
-    #     assert args.batch_size <= len(generate_y_np) # num_samples
-    #     guide_x = th.from_numpy(guide_x_np[:args.batch_size]).to(dist_util.dev())
-    #     guide_x = (guide_x*2. -1.).clamp(-1., 1.)
-    #     generate_y = th.from_numpy(generate_y_np[:args.batch_size]).to(dist_util.dev())
-    #     guide_y_np = np.array(GUIDE_Y)
-    #     guide_y = th.from_numpy(guide_y_np[:args.batch_size]).to(dist_util.dev())
-    #     if args.guide_as_generate:
-    #         guide_y = generate_y.detach().clone()
-    #         guide_y_np = guide_y.cpu().numpy()
-    # else: 
-    #     guide_x_np = np.array([])
-    #     logger.log("This experiment is not guide_exp")
-    #     guide_y = generate_y = th.randint(
-    #         low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
-    #     )
-
     # modify conf_fn and model_fn to get adv
     CenterCrop = lambda x: x[:, :, 16:240, 16:240]
-    def cond_fn(x, t, y=None, **kwargs):
+    def cond_fn(x, t, y=None, guide_x=None, guide_y=None, target=True, **kwargs):
         assert y is not None
+        assert guide_x is not None
+        if target: assert guide_y is not None
         time = t[0].detach().clone().cpu().item()
         with th.enable_grad():
             generate_loss = 0
@@ -164,7 +143,7 @@ def main():
             
             if args.use_ssim == True: 
                 # ssim need input range from [0, 1]
-                ssim_loss = ssim((guide_x+1)/2, (x_in+1)/2, data_range=1, size_average=True)
+                ssim_loss = ms_ssim((guide_x+1)/2, (x_in+1)/2, data_range=1, size_average=True)
             
             if args.use_mse == True:
                 _, guide_hidden = classifier(guide_x, t, \
@@ -177,13 +156,18 @@ def main():
             if time > args.splitT:
                 logits = classifier(x_in, t)
                 log_probs = F.log_softmax(logits, dim=-1)
-                selected = log_probs[range(len(logits)), generate_y.view(-1)] 
+                selected = log_probs[range(len(logits)), y.view(-1)] 
                 generate_loss = selected.sum()
 
             if time < args.splitT:
                 attack_logits = attack_model(((CenterCrop(x_in)+1)/2.))
                 attack_log_probs = F.log_softmax(attack_logits, dim=-1)
-                attack_selected = attack_log_probs[range(len(logits)), guide_y.view(-1)] 
+                if target:
+                    attack_selected = attack_log_probs[range(len(logits)), guide_y.view(-1)] 
+                else:
+                    y_onehot = one_hot(y, NUM_CLASSES)
+                    attack_selected = ((1.0 - y_onehot) * attack_log_probs
+                     - (y_onehot * TARGET_MULT)).max(1)[0]
                 adv_loss = attack_selected.sum()
 
             loss = generate_loss* args.generate_scale
@@ -192,7 +176,7 @@ def main():
             loss += hidden_loss * args.hidden_scale
             loss -= lpips_loss * args.lpips_scale
             gradient = th.autograd.grad(loss, x_in)[0]
-        logger.log("t:{}, generate: {}, guide:{}, ssim:{}, lpips:{}".format(time,selected.sum(),adv_loss,ssim_loss, lpips_loss))
+        logger.log(f"t:{time}, generate: {generate_loss}, guide:{adv_loss}, ssim:{ssim_loss}, lpips:{lpips_loss}")
         return gradient
 
     def model_fn(x, t, y=None, **kwargs):
@@ -201,13 +185,20 @@ def main():
 
     logger.log("sampling...", DT())
     all_images = []
+    all_oriimages = []
     all_labels = []
     all_predict = []
-    model_kwargs = {"y": generate_y}
+    acc = 0
     sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
     while len(all_images) * args.batch_size < args.num_samples:
+        guide_x, y = data_generator.__next__()
+        guide_x, y = guide_x.to(dist_util.dev()), y.to(dist_util.dev())
+        model_kwargs = {"y": y} # what label pic should looks like
+        model_kwargs["guide_x"] = guide_x  # what pic should looks like
+        model_kwargs["guide_y"] = None # untarget attack
+        model_kwargs["target"] = False
         sample = sample_fn(
             model_fn,
             (args.batch_size, 3, args.image_size, args.image_size),
@@ -216,45 +207,38 @@ def main():
             cond_fn=cond_fn,
             device=dist_util.dev(),
         )
-        # log_probs = classifier(sample, th.zeros_like(generate_y))
         log_probs = attack_model(((CenterCrop(sample)+1)/2.))
         predict = log_probs.argmax(dim=-1)
 
-        sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
-        sample = sample.permute(0, 2, 3, 1)
-        sample = sample.contiguous()
-        # collect sample from each process
-
-        def gether(sample):
-            gathered_samples = [th.zeros_like(sample) for _ in range(dist.get_world_size())]
-            dist.all_gather(gathered_samples, sample)  # gather not supported with NCCL
-            return [sample.cpu().numpy() for sample in gathered_samples]
-
+        def gether(data):
+            gathered_data = [th.zeros_like(data) for _ in range(dist.get_world_size())]
+            dist.all_gather(gathered_data, data)  # gather not supported with NCCL
+            return [data.cpu().numpy() for data in gathered_data]
+        
         all_images.extend(gether(sample))
-        all_labels.extend(gether(generate_y))
+        all_oriimages.extend(gether(guide_x))
+        all_labels.extend(gether(y))
         all_predict.extend(gether(predict))
-        logger.log(f"created {len(all_images) * args.batch_size} samples")
-
+        acc += sum(predict != y)
+        logger.log(f"attack success {acc} / {len(all_images) * args.batch_size}")
     
-    arr = np.concatenate(all_images, axis=0)[: args.num_samples] # arr: genrate result
-    label_arr = np.concatenate(all_labels, axis=0)[: args.num_samples] # label_arr: generate_y
-    predict_arr = np.concatenate(all_predict, axis=0)[: args.num_samples] # predict result
-    
+    logger.log("sampling complete", DT())
     if dist.get_rank() == 0:
+        arr = np.concatenate(all_images, axis=0)[: args.num_samples] 
+        oriimages = np.concatenate(all_oriimages, axis=0)[: args.num_samples] 
+        label_arr = np.concatenate(all_labels, axis=0)[: args.num_samples]
+        predict_arr = np.concatenate(all_predict, axis=0)[: args.num_samples] 
+
+        arr2pic_save(arr, logger.get_dir(), 5, "result.jpg")
+        arr2pic_save(oriimages, logger.get_dir(), 5, "original.jpg")
+
         shape_str = "x".join([str(x) for x in arr.shape])
         out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
         logger.log(f"saving to {out_path}")
-        arr2pic_save(arr, logger.get_dir())
-        # print label and save data
-        map_i_s = get_idex2name_map(INDEX2NAME_MAP_PATH)
-        for i, (y_, p_) in enumerate(zip(label_arr, predict_arr)):
-            g_y = guide_y_np[i%args.batch_size] if args.guide_exp else guide_y_np[i]
-            logger.log(f"original_label_{i}:{y_}, guide_y_{i%args.batch_size}:{g_y}, predict{i}:{p_}")
-            logger.log(f"{map_i_s[y_]} ; {map_i_s[g_y]}; {map_i_s[p_]}")
-        np.savez(out_path, arr, label_arr, guide_y_np, predict_arr, guide_x_np)
+        np.savez(out_path, arr, oriimages, label_arr, predict_arr)
     
     dist.barrier()
-    logger.log("sampling complete", DT())
+    logger.log("complete")
 
 if __name__ == "__main__":
     main()
