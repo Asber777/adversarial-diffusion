@@ -25,6 +25,7 @@ from guided_diffusion.script_util import (
     create_classifier,
     add_dict_to_argparser,
     args_to_dict,
+    load_imagenet_batch, 
     get_idex2name_map, 
     save_args, 
     arr2pic_save, 
@@ -120,27 +121,29 @@ def main():
 
     loss_fn_alex = lpips.LPIPS(net='alex')
     loss_fn_alex = loss_fn_alex.to(dist_util.dev())
+
+    data_generator = load_imagenet_batch(args.batch_size, '/root/hhtpro/123/imagenet')
     
-    if args.guide_exp: # 之后要改
-        logger.log("This experimen t is guide_exp")
-        guide_path = osp.join(args.result_dir, args.guide_exp, "samples_5x256x256x3.npz")
-        guide_np = np.load(guide_path)
-        guide_x_np, generate_y_np = guide_np['arr_0'], guide_np['arr_1']
-        assert args.batch_size <= len(generate_y_np) # num_samples
-        guide_x = th.from_numpy(guide_x_np[:args.batch_size]).to(dist_util.dev())
-        guide_x = (guide_x*2. -1.).clamp(-1., 1.)
-        generate_y = th.from_numpy(generate_y_np[:args.batch_size]).to(dist_util.dev())
-        guide_y_np = np.array(GUIDE_Y)
-        guide_y = th.from_numpy(guide_y_np[:args.batch_size]).to(dist_util.dev())
-        if args.guide_as_generate:
-            guide_y = generate_y.detach().clone()
-            guide_y_np = guide_y.cpu().numpy()
-    else: 
-        guide_x_np = np.array([])
-        logger.log("This experiment is not guide_exp")
-        guide_y = generate_y = th.randint(
-            low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
-        )
+    # if args.guide_exp:
+    #     logger.log("This experimen t is guide_exp")
+    #     guide_path = osp.join(args.result_dir, args.guide_exp, "samples_5x256x256x3.npz")
+    #     guide_np = np.load(guide_path)
+    #     guide_x_np, generate_y_np = guide_np['arr_0'], guide_np['arr_1']
+    #     assert args.batch_size <= len(generate_y_np) # num_samples
+    #     guide_x = th.from_numpy(guide_x_np[:args.batch_size]).to(dist_util.dev())
+    #     guide_x = (guide_x*2. -1.).clamp(-1., 1.)
+    #     generate_y = th.from_numpy(generate_y_np[:args.batch_size]).to(dist_util.dev())
+    #     guide_y_np = np.array(GUIDE_Y)
+    #     guide_y = th.from_numpy(guide_y_np[:args.batch_size]).to(dist_util.dev())
+    #     if args.guide_as_generate:
+    #         guide_y = generate_y.detach().clone()
+    #         guide_y_np = guide_y.cpu().numpy()
+    # else: 
+    #     guide_x_np = np.array([])
+    #     logger.log("This experiment is not guide_exp")
+    #     guide_y = generate_y = th.randint(
+    #         low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
+    #     )
 
     # modify conf_fn and model_fn to get adv
     CenterCrop = lambda x: x[:, :, 16:240, 16:240]

@@ -19,18 +19,42 @@ def get_idex2name_map(INDEX2NAME_MAP_PATH):
             result_dict[int(sample_[0])]=sample_[1].split('\n')[0]
     return result_dict
 
-def arr2pic_save(arr, logdir, SHOW_PIC_N=5):
+def arr2pic_save(arr, logdir, SHOW_PIC_N=5, name="result.jpg"):
     picture = th.from_numpy(arr[:SHOW_PIC_N])
     picture = picture.permute(0, 3, 1, 2)
     picture = th.cat([pic for pic in picture], 2)
     unloader = transforms.ToPILImage()
-    unloader(picture).save(osp.join(logdir, "result.jpg"))
+    unloader(picture).save(osp.join(logdir, name))
 
 def save_args(logger_dir, args):
     args_path = os.path.join(logger_dir, f"exp.json")
     info_json = json.dumps(vars(args), sort_keys=False, indent=4, separators=(' ', ':'))
     with open(args_path, 'w') as f:
         f.write(info_json)
+
+from typing import Callable, Optional, Tuple
+from robustbench.data import PREPROCESSINGS
+import torchvision.transforms as transforms
+from robustbench.loaders import CustomImageFolder
+import torch.utils.data as data
+PREPROCESSINGS['Res256Crop256'] = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(256),
+        transforms.ToTensor()
+    ])
+
+def load_imagenet_batch(
+    batch_size: Optional[int] = 5,
+    data_dir: str = './data',
+    transforms_test: Callable = PREPROCESSINGS['Res256Crop256']
+) -> Tuple[th.Tensor, th.Tensor]:
+    imagenet = CustomImageFolder(data_dir + '/val', transforms_test)
+    test_loader = data.DataLoader(imagenet,
+                                  batch_size=batch_size,
+                                  shuffle=False,
+                                  num_workers=4)
+    for x, y, p in test_loader:
+        yield x*2 -1.0, y
 
 def diffusion_defaults():
     """

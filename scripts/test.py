@@ -9,26 +9,28 @@
 
 
 
-'''from robustbench.data import load_imagenet
-# from robustbench.utils import clean_accuracy, load_model
-from robustbench.data import PREPROCESSINGS
-# model = load_model('Standard_R50', dataset='imagenet', threat_model='Linf').cuda()
-import torchvision.transforms as transforms
-tfs = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(256),
-        transforms.ToTensor()
-    ])
-x, y = load_imagenet(n_examples=5, data_dir='/root/hhtpro/123/imagenet', transforms_test=tfs)
-path = "result/256_guide_pic/samples_5x256x256x3.npz"
-import numpy as np
-all_images = [[xx.numpy()] for xx in x]
-all_labels = [[yy.numpy()] for yy in y]
-arr = np.concatenate(all_images, axis=0)
-label_arr = np.concatenate(all_labels, axis=0)
-np.savez(path, arr, label_arr)
 
-'''
+# from robustbench.data import load_imagenet
+# # from robustbench.utils import clean_accuracy, load_model
+# from robustbench.data import PREPROCESSINGS
+# # model = load_model('Standard_R50', dataset='imagenet', threat_model='Linf').cuda()
+# import torchvision.transforms as transforms
+# tfs = transforms.Compose([
+#         transforms.Resize(256),
+#         transforms.CenterCrop(256),
+#         transforms.ToTensor()
+#     ])
+# x, y = load_imagenet(n_examples=5, data_dir='/root/hhtpro/123/imagenet', transforms_test=tfs)
+# path = "result/256_guide_pic/samples_5x256x256x3.npz"
+
+# import numpy as np
+# all_images = [[xx.numpy()] for xx in x]
+# all_labels = [[yy.numpy()] for yy in y]
+# arr = np.concatenate(all_images, axis=0)
+# label_arr = np.concatenate(all_labels, axis=0)
+# np.savez(path, arr, label_arr)
+
+
 # acc = clean_accuracy(model, x.cuda(), y.cuda(), device=torch.device('cuda'))
 # x_in is 64x64 in [-1, 1]
 # x = x.cuda()
@@ -46,13 +48,13 @@ np.savez(path, arr, label_arr)
 # print(os.path.split(os.path.realpath(__file__))[0])
 # #找到父路径下的其他文件，即同级的其他文件
 # # print(os.path.join(proDir,"config.ini"))
-import torch 
-from torch.utils.tensorboard import SummaryWriter
-writer = SummaryWriter('/testwhy')
+# import torch 
+# from torch.utils.tensorboard import SummaryWriter
+# writer = SummaryWriter('/testwhy')
 
-x = range(100)
-for i in x:
-    writer.add_scalar('y=2x', i * 2, i)
+# x = range(100)
+# for i in x:
+#     writer.add_scalar('y=2x', i * 2, i)
 
 
 # def func(i):
