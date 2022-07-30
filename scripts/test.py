@@ -10,6 +10,8 @@
 
 
 
+
+
 # from robustbench.data import load_imagenet
 # # from robustbench.utils import clean_accuracy, load_model
 # from robustbench.data import PREPROCESSINGS
@@ -49,12 +51,14 @@
 # #找到父路径下的其他文件，即同级的其他文件
 # # print(os.path.join(proDir,"config.ini"))
 # import torch 
-# from torch.utils.tensorboard import SummaryWriter
-# writer = SummaryWriter('/testwhy')
-
-# x = range(100)
-# for i in x:
-#     writer.add_scalar('y=2x', i * 2, i)
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter('/root/hhtpro/123/guided-diffusion/scripts/testwhy')
+for t in range(100):
+    writer.add_scalar('y=2x_origi', t * 2, t)
+def cond_fn(t):
+    writer.add_scalar('y=2x', t * 2, t)
+from test2 import fun_out
+fun_out(cond_fn)
 
 
 # def func(i):

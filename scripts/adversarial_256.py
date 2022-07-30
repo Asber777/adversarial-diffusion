@@ -27,6 +27,7 @@ from guided_diffusion.script_util import (
     get_idex2name_map, 
     save_args, 
     arr2pic_save, 
+    pgd, 
 )
 TARGET_MULT = 10000.0
 hidden_index = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
@@ -37,34 +38,38 @@ DT = lambda :datetime.datetime.now().strftime("adv-%Y-%m-%d-%H-%M-%S-%f")
 def create_argparser():
     defaults = dict(
         result_dir='/root/hhtpro/123/result', # where to store experiments
-        describe="default_desc",
-        guide_exp="256_guide_pic", # where to load original picture
+        describe="256_just_classifier",
         clip_denoised=True,
         num_samples=5,
         batch_size=5,
         model_path="/root/hhtpro/123/256x256_diffusion.pt",
         classifier_path="/root/hhtpro/123/256x256_classifier.pt",
-        splitT=500, 
+        splitT=300, 
         generate_scale=1.0,
-        guide_scale=10.0, 
-        hidden_scale=1.0,
-        lpips_scale=0.0, 
-        ssim_scale=0.0, 
-        use_lpips=False, 
+        guide_scale=45.0, 
+        hidden_scale=5.0,
+        lpips_scale=5.0, 
+        ssim_scale=5.0, 
+        use_lpips=True,
         use_mse=False,
-        use_ssim=False, 
-        get_hidden=False,
-        get_middle=False, 
+        use_ssim=True, 
+        use_pgd=False, 
+        get_hidden=True,
+        get_middle=True, 
         guide_as_generate=False, 
-        attack_model_name="Salman2020Do_50_2",
+        attack_model_name="Standard_R50",
         attack_model_type='Linf',
+        target_attack=True, 
+        target=[123,234,345,456,567]
     )
     defaults.update(model_and_diffusion_defaults())
     defaults.update(classifier_defaults())
     # MODEL_FLAGS
     model_flags = dict(
-        timestep_respacing='ddim25', 
-        use_ddim=True,
+        # timestep_respacing=[25,25,5,4,3,1,1,1,1,1],  # [30,30,5,5,5,4,4,4,4,4] "ddim25"
+        # use_ddim=True,
+        timestep_respacing = [125],
+        use_ddim = False, 
         image_size=256, 
         attention_resolutions="32,16,8",
         class_cond=True, 
@@ -121,30 +126,35 @@ def main():
     loss_fn_alex = loss_fn_alex.to(dist_util.dev())
 
     data_generator = load_imagenet_batch(args.batch_size, '/root/hhtpro/123/imagenet')
-    
+    writer = SummaryWriter(logger.get_dir())
     # modify conf_fn and model_fn to get adv
     CenterCrop = lambda x: x[:, :, 16:240, 16:240]
-    def cond_fn(x, t, y=None, guide_x=None, guide_y=None, target=True, **kwargs):
+    map_i_s = get_idex2name_map(INDEX2NAME_MAP_PATH)
+    mapname = lambda predict: [map_i_s[i] for i in predict.cpu().numpy()]
+    index, g = 0, 0
+    get_grid = lambda pic: make_grid(pic.detach().clone(), args.batch_size, normalize=True)
+    def cond_fn(x, t, y=None, guide_x=None, guide_y=None, **kwargs):
+        nonlocal writer, index, g
         assert y is not None
         assert guide_x is not None
-        if target: assert guide_y is not None
-        time = t[0].detach().clone().cpu().item()
+        if args.target_attack: 
+            guide_y = th.from_numpy(np.array(guide_y)).to(dist_util.dev())
+        time = int(t[0]) # using this variable in add_scalar will GO WRONG!
         with th.enable_grad():
             generate_loss = 0
             hidden_loss = 0
             lpips_loss = 0
             ssim_loss = 0
             adv_loss = 0
+            loss = 0
 
             x_in = x.detach().requires_grad_(True)
             if args.use_lpips == True:
                 # input need to be range from [-1, 1]
                 lpips_loss += loss_fn_alex.forward(x_in, guide_x).sum()
-            
             if args.use_ssim == True: 
                 # ssim need input range from [0, 1]
-                ssim_loss = ms_ssim((guide_x+1)/2, (x_in+1)/2, data_range=1, size_average=True)
-            
+                ssim_loss = ssim((guide_x+1)/2, (x_in+1)/2, data_range=1, size_average=True)
             if args.use_mse == True:
                 _, guide_hidden = classifier(guide_x, t, \
                     args.get_hidden, args.get_middle, hidden_index)
@@ -153,30 +163,57 @@ def main():
                 for h, gh in zip(hidden, guide_hidden):
                     hidden_loss -= ((h - gh)**2).mean()
             
-            if time > args.splitT:
-                logits = classifier(x_in, t)
-                log_probs = F.log_softmax(logits, dim=-1)
-                selected = log_probs[range(len(logits)), y.view(-1)] 
-                generate_loss = selected.sum()
+            logits = classifier(x_in, t)
+            log_probs = F.log_softmax(logits, dim=-1)
+            attack_logits = attack_model(((CenterCrop(x_in)+1)/2.))
+            attack_log_probs = F.log_softmax(attack_logits, dim=-1)
+            
+            if not args.target_attack: 
+                if time <= args.splitT:
+                    # optimize generate_term and guide_term when t < splitT together
+                    selected = log_probs[range(len(logits)), y.view(-1)] 
+                    generate_loss = selected.sum()
 
-            if time < args.splitT:
-                attack_logits = attack_model(((CenterCrop(x_in)+1)/2.))
-                attack_log_probs = F.log_softmax(attack_logits, dim=-1)
-                if target:
-                    attack_selected = attack_log_probs[range(len(logits)), guide_y.view(-1)] 
-                else:
                     y_onehot = one_hot(y, NUM_CLASSES)
-                    attack_selected = ((1.0 - y_onehot) * attack_log_probs
-                     - (y_onehot * TARGET_MULT)).max(1)[0]
-                adv_loss = attack_selected.sum()
+                    attack_selected = ((1.0 - y_onehot) * log_probs 
+                    - (y_onehot * TARGET_MULT)).max(1)[0]
+                    adv_loss = attack_selected.sum()
+            else: 
+                # 最初的版本 只对classifier进行攻击
+                if time > args.splitT: 
+                    generate_loss = log_probs[range(len(logits)), y.view(-1)].sum()
+                else: 
+                    # generate_loss = log_probs[range(len(logits)), guide_y.view(-1)].sum()
+                    adv_loss = log_probs[range(len(logits)), guide_y.view(-1)].sum()
+                    # adv_loss = attack_log_probs[range(len(logits)), guide_y.view(-1)].sum()
+                    # generate_loss -= log_probs[range(len(logits)), y.view(-1)].sum()
+                    # adv_loss = attack_log_probs[range(len(logits)), guide_y.view(-1)].sum()
 
-            loss = generate_loss* args.generate_scale
+            loss += generate_loss* args.generate_scale
             loss += adv_loss * args.guide_scale
             loss += ssim_loss * args.ssim_scale
             loss += hidden_loss * args.hidden_scale
             loss -= lpips_loss * args.lpips_scale
             gradient = th.autograd.grad(loss, x_in)[0]
-        logger.log(f"t:{time}, generate: {generate_loss}, guide:{adv_loss}, ssim:{ssim_loss}, lpips:{lpips_loss}")
+
+        # logger.log(f"{time}\n max of logits:{th.topk(logits, 3, 1)}; \
+        #      max of attack_logits:{th.topk(attack_logits, 3, 1)} \n")
+        writer.add_histogram(f'group{g}/classifier_logits', log_probs, index)
+        writer.add_histogram(f'group{g}/attack_logits', attack_log_probs, index)
+        writer.add_scalar(f'group{g}/t', time, index)
+        writer.add_scalar(f'group{g}/generate_loss', generate_loss, index)
+        writer.add_scalar(f'group{g}/adv_loss', adv_loss, index)
+        writer.add_scalar(f'group{g}/ssim_loss', ssim_loss, index)
+        writer.add_scalar(f'group{g}/lpips_loss', lpips_loss, index)
+        writer.add_image(f'group{g}/gradient', get_grid(gradient), index)
+        pic = kwargs['mean'].float() + kwargs['variance'] * gradient.float()
+        writer.add_image(f'group{g}/x', get_grid(pic), index)
+        index += 40 if args.timestep_respacing == 'ddim25' else 1
+        if args.use_pgd and t[0] < 10:
+            x = pic * 0.5 + 0.5
+            advx = pgd(x, guide_y, )
+            new_mean = (advx - 0.5) * 2.0
+            return new_mean
         return gradient
 
     def model_fn(x, t, y=None, **kwargs):
@@ -188,17 +225,19 @@ def main():
     all_oriimages = []
     all_labels = []
     all_predict = []
-    acc = 0
+    attack_acc = 0
+    attack_clas_acc = 0
+    
     sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
     while len(all_images) * args.batch_size < args.num_samples:
         guide_x, y = data_generator.__next__()
         guide_x, y = guide_x.to(dist_util.dev()), y.to(dist_util.dev())
+        writer.add_image(f'group{g}/guide_x', get_grid(guide_x), index)
         model_kwargs = {"y": y} # what label pic should looks like
         model_kwargs["guide_x"] = guide_x  # what pic should looks like
-        model_kwargs["guide_y"] = None # untarget attack
-        model_kwargs["target"] = False
+        model_kwargs["guide_y"] = None if not args.target_attack else args.target
         sample = sample_fn(
             model_fn,
             (args.batch_size, 3, args.image_size, args.image_size),
@@ -207,8 +246,14 @@ def main():
             cond_fn=cond_fn,
             device=dist_util.dev(),
         )
-        log_probs = attack_model(((CenterCrop(sample)+1)/2.))
-        predict = log_probs.argmax(dim=-1)
+        writer.add_image(f'group{g}/x', get_grid(sample), index)
+        at_predict = attack_model(((CenterCrop(sample)+1)/2.)).argmax(dim=-1)
+        attack_acc += sum(at_predict != y)
+        cl_predict = classifier(sample, th.zeros_like(y)).argmax(dim=-1)
+        attack_clas_acc += sum(cl_predict != y)
+        logger.log(f'y: {y.cpu().numpy()}, {[map_i_s[i] for i in y.cpu().numpy()]}')
+        logger.log(f'predict of attack_model: {at_predict.cpu().numpy()}, {mapname(at_predict)}')
+        logger.log(f'predict of classifier: {cl_predict.cpu().numpy()}, {mapname(cl_predict)}')
 
         def gether(data):
             gathered_data = [th.zeros_like(data) for _ in range(dist.get_world_size())]
@@ -218,10 +263,11 @@ def main():
         all_images.extend(gether(sample))
         all_oriimages.extend(gether(guide_x))
         all_labels.extend(gether(y))
-        all_predict.extend(gether(predict))
-        acc += sum(predict != y)
-        logger.log(f"attack success {acc} / {len(all_images) * args.batch_size}")
-    
+        all_predict.extend(gether(cl_predict))
+
+        logger.log(f"attack success {attack_acc} / {len(all_images) * args.batch_size}")
+        logger.log(f"attack  classifier success {attack_clas_acc} / {len(all_images) * args.batch_size}")
+        g += 1
     logger.log("sampling complete", DT())
     if dist.get_rank() == 0:
         arr = np.concatenate(all_images, axis=0)[: args.num_samples] 
@@ -236,6 +282,7 @@ def main():
         out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
         logger.log(f"saving to {out_path}")
         np.savez(out_path, arr, oriimages, label_arr, predict_arr)
+        writer.close()
     
     dist.barrier()
     logger.log("complete")

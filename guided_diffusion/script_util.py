@@ -1,6 +1,7 @@
 import argparse
 import inspect
 import os, json
+from re import A
 import torch as th 
 from torchvision import transforms
 import os.path as osp
@@ -9,6 +10,8 @@ from .respace import SpacedDiffusion, space_timesteps
 from .unet import SuperResModel, UNetModel, EncoderUNetModel
 
 NUM_CLASSES = 1000
+def pgd(x, guide_y, ):
+    pass
 
 def get_idex2name_map(INDEX2NAME_MAP_PATH):
     result_dict = {}
@@ -44,13 +47,19 @@ PREPROCESSINGS['Res256Crop256'] = transforms.Compose([
         transforms.CenterCrop(256),
         transforms.ToTensor()
     ])
-
+PREPROCESSINGS['Res64Crop64'] = transforms.Compose([
+        transforms.Resize(64),
+        transforms.CenterCrop(64),
+        transforms.ToTensor()
+    ])
 def load_imagenet_batch(
     batch_size: Optional[int] = 5,
     data_dir: str = './data',
-    transforms_test: Callable = PREPROCESSINGS['Res256Crop256']
+    transforms: str = 'Res256Crop256'
 ) -> Tuple[th.Tensor, th.Tensor]:
-    imagenet = CustomImageFolder(data_dir + '/val', transforms_test)
+    assert transforms in PREPROCESSINGS
+    imagenet = CustomImageFolder(data_dir + '/val', 
+        PREPROCESSINGS[transforms])
     test_loader = data.DataLoader(imagenet,
                                   batch_size=batch_size,
                                   shuffle=False,

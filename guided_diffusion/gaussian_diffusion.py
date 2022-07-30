@@ -365,6 +365,8 @@ class GaussianDiffusion:
         # mean of next X, so you need to wrap mean and variance to model_kwargs,
         # and send to cond_fn. 
         """
+        model_kwargs['mean'] = p_mean_var["mean"]
+        model_kwargs['variance'] = p_mean_var["variance"]
         gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
         new_mean = (
             p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
@@ -387,6 +389,8 @@ class GaussianDiffusion:
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
 
         eps = self._predict_eps_from_xstart(x, t, p_mean_var["pred_xstart"])
+        model_kwargs['mean'] = p_mean_var["mean"]
+        model_kwargs['variance'] = p_mean_var["variance"]
         eps = eps - (1 - alpha_bar).sqrt() * cond_fn(
             x, self._scale_timesteps(t), **model_kwargs
         )
